@@ -5,3 +5,4 @@ install
 obj
 /.vs/RedisCachingProvider/v14
 /Release/RedisCachingProvider_01.00.04_Source/.vs/RedisCachingProvider/v14
+*.suo
