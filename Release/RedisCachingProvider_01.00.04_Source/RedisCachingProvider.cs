@@ -18,383 +18,377 @@ using System.Linq;
 
 namespace DotNetNuke.Providers.RedisCachingProvider
 {
-	public class RedisCachingProvider: CachingProvider
-	{
+    public class RedisCachingProvider : CachingProvider
+    {
+        #region Private Members
 
-		#region Private Members
+        private const string ProviderName = "RedisCachingProvider";
+        private const bool DefaultUseCompression = false;
 
-		private const string ProviderName = "RedisCachingProvider";
-		private const bool DefaultUseCompression = false;
-		private const string DefaultPort = "6379";
-		private const string SslDefaultPort = "6380";
+        private static string GetProviderConfigAttribute(string attributeName, string defaultValue = "")
+        {
+            var provider = Config.GetProvider("caching", ProviderName);
+            if (provider != null && provider.Attributes.AllKeys.Contains(attributeName))
+                return provider.Attributes[attributeName];
+            return defaultValue;
+        }
 
-		private static string GetProviderConfigAttribute(string attributeName, string defaultValue = "")
-		{
-			var provider = Config.GetProvider("caching", ProviderName);
-			if (provider != null && provider.Attributes.AllKeys.Contains(attributeName))
-				return provider.Attributes[attributeName];
-			return defaultValue;
-		}
+        private static bool UseCompression
+        {
+            get { return bool.Parse(GetProviderConfigAttribute("useCompression", DefaultUseCompression.ToString(CultureInfo.InvariantCulture))); }
+        }
 
-		private static bool UseCompression
-		{
-			get { return bool.Parse(GetProviderConfigAttribute("useCompression", DefaultUseCompression.ToString(CultureInfo.InvariantCulture))); }
-		}
+        private static string ConnectionString
+        {
+            get
+            {
+                var cs = ConfigurationManager.ConnectionStrings["RedisCachingProvider"];
+                if (cs == null || string.IsNullOrEmpty(cs.ConnectionString))
+                {
+                    throw new ConfigurationErrorsException(
+                        "The Redis connection string can't be an empty string. Check the RedisCachingProvider connectionString attribute in your web.config file.");
+                }
+                return cs.ConnectionString;
+            }
+        }
 
-		private static string ConnectionString
-		{
-			get
-			{
-				var cs = ConfigurationManager.ConnectionStrings["RedisCachingProvider"];
-				if (cs == null || string.IsNullOrEmpty(cs.ConnectionString))
-				{
-					throw new ConfigurationErrorsException(
-						"The Redis connection string can't be an empty string. Check the RedisCachingProvider connectionString attribute in your web.config file.");
-				}
-				return cs.ConnectionString;
-			}
-		}
-
-
-
-		private static string _keyPrefix;
-		private static string KeyPrefix 
-		{
-			get
-			{
-				if (string.IsNullOrEmpty(_keyPrefix))
-				{
-					var hostGuid = string.Empty;
-					if (HttpContext.Current != null)
-					{
-						hostGuid = Entities.Host.Host.GUID;
-					}
-					_keyPrefix = string.Format("{0}_", GetProviderConfigAttribute("keyPrefix", hostGuid));
-				}
-				return _keyPrefix;
-			} 
-		}
+        private static string _keyPrefix;
+        private static string KeyPrefix
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(_keyPrefix))
+                {
+                    var hostGuid = string.Empty;
+                    if (HttpContext.Current != null)
+                    {
+                        hostGuid = Entities.Host.Host.GUID;
+                    }
+                    _keyPrefix = string.Format("{0}_", GetProviderConfigAttribute("keyPrefix", hostGuid));
+                }
+                return _keyPrefix;
+            }
+        }
 
 
-		private static readonly Lazy<ConnectionMultiplexer> LazyConnection = new Lazy<ConnectionMultiplexer>(() =>
-		{
-			var cn = ConnectionMultiplexer.Connect(ConnectionString);
-			cn.GetSubscriber()
-				.Subscribe(new RedisChannel(KeyPrefix + "Redis.*", RedisChannel.PatternMode.Pattern),
-					ProcessMessage);
-			return cn;
-		});
+        private static readonly Lazy<ConnectionMultiplexer> LazyConnection = new Lazy<ConnectionMultiplexer>(() =>
+        {
+            var cn = ConnectionMultiplexer.Connect(ConnectionString);
+            cn.GetSubscriber()
+                .Subscribe(new RedisChannel(KeyPrefix + "Redis.*", RedisChannel.PatternMode.Pattern),
+                    ProcessMessage);
+            return cn;
+        });
 
-		private static ConnectionMultiplexer Connection
-		{
-			get { return LazyConnection.Value; }
-		}
+        private static ConnectionMultiplexer Connection
+        {
+            get { return LazyConnection.Value; }
+        }
 
-		private static void ProcessMessage(RedisChannel redisChannel, RedisValue redisValue)
-		{
-			try
-			{
+        private static void ProcessMessage(RedisChannel redisChannel, RedisValue redisValue)
+        {
+            try
+            {
                 var message = redisValue.ToString();
                 var values = message.Split(':');
-                if (values[0] == InstanceUniqueId)
+                if (values.Length < 2 || values[0] == InstanceUniqueId)
                 {
-                    // Avoid to clear twice
+                    // Ignore incorrect message and avoid to clear twice
                     return;
                 }
 
-                var instance = (RedisCachingProvider) Instance() ?? new RedisCachingProvider();
-				if (redisChannel == KeyPrefix + "Redis.Clear")
-				{
+                var instance = (RedisCachingProvider)Instance() ?? new RedisCachingProvider();
+                if (redisChannel == KeyPrefix + "Redis.Clear")
+                {
                     var key = message.Substring(values[0].Length + values[1].Length + 2);
                     instance.Clear(values[1], key, false);
                 }
-				else
-				{
+                else if (redisChannel == KeyPrefix + "Redis.Remove")
+                {
                     var key = message.Substring(values[0].Length + 1);
                     instance.Remove(key, false);
                 }
-			}
-			catch (Exception e)
-			{
-				if (!ProcessException(e)) throw;
-			}
-		}
+            }
+            catch (Exception e)
+            {
+                if (!ProcessException(e)) throw;
+            }
+        }
 
-		private static IDatabase _redisCache;
-		private static IDatabase RedisCache
-		{
-			get { return _redisCache ?? (_redisCache = Connection.GetDatabase()); }
-		}
+        private static IDatabase _redisCache;
+        private static IDatabase RedisCache
+        {
+            get { return _redisCache ?? (_redisCache = Connection.GetDatabase()); }
+        }
 
-		#endregion
+        #endregion
 
-		#region Abstract implementation
-		public override void Insert(string key, object value, DNNCacheDependency dependency, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority,
-									CacheItemRemovedCallback onRemoveCallback)
-		{
-			try
-			{
-				// Calculate expiry 
-				TimeSpan? expiry = null;
-				if (absoluteExpiration != DateTime.MinValue)
-				{
-					expiry = absoluteExpiration.Subtract(DateTime.UtcNow);
-				}
-				else
-				{
-					if (slidingExpiration != TimeSpan.Zero)
-					{
-						expiry = slidingExpiration;
-					}
-				}         
+        #region Abstract implementation
+        public override void Insert(string key, object value, DNNCacheDependency dependency, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority,
+                                    CacheItemRemovedCallback onRemoveCallback)
+        {
+            try
+            {
+                // Calculate expiry 
+                TimeSpan? expiry = null;
+                if (absoluteExpiration != DateTime.MinValue)
+                {
+                    expiry = absoluteExpiration.Subtract(DateTime.UtcNow);
+                }
+                else
+                {
+                    if (slidingExpiration != TimeSpan.Zero)
+                    {
+                        expiry = slidingExpiration;
+                    }
+                }
 
-				if (UseCompression)
-				{
-					var cvalue = CompressData(value);
-					base.Insert(key, cvalue, dependency, absoluteExpiration, slidingExpiration,
-								priority, onRemoveCallback);
-					RedisCache.StringSet(KeyPrefix + key, Serialize(cvalue), expiry);
-				}
-				else
-				{
-					base.Insert(key, value, dependency, absoluteExpiration, slidingExpiration,
-								priority, onRemoveCallback);
-					RedisCache.StringSet(KeyPrefix + key, Serialize(value), expiry);                    
-				}
-			}
-			catch (Exception e)
-			{
-				if (!ProcessException(e, key, value)) throw;
-			}
+                if (UseCompression)
+                {
+                    var cvalue = CompressData(value);
+                    base.Insert(key, cvalue, dependency, absoluteExpiration, slidingExpiration,
+                                priority, onRemoveCallback);
 
-		}
+                    RedisCache.StringSet(KeyPrefix + key, Serialize(cvalue), expiry);
+                }
+                else
+                {
+                    base.Insert(key, value, dependency, absoluteExpiration, slidingExpiration,
+                                priority, onRemoveCallback);
+                    RedisCache.StringSet(KeyPrefix + key, Serialize(value), expiry);
+                }
+            }
+            catch (Exception e)
+            {
+                if (!ProcessException(e, key, value)) throw;
+            }
 
-
-		/// <summary>
-		/// Gets the item. Note: sliding expiration not implemented to avoid too many requests to the redis server
-		/// (see http://stackoverflow.com/questions/20280316/absolute-and-sliding-caching-in-redis)
-		/// </summary>
-		/// <param name="key">The key.</param>
-		/// <returns></returns>
-		public override object GetItem(string key)
-		{
-			try
-			{
-				var v = base.GetItem(key);
-				if (v != null)
-				{
-					return v;
-				}
-				var value = RedisCache.StringGet(KeyPrefix + key);
-				if (value.HasValue)
-				{
-					var ttl = RedisCache.KeyTimeToLive(KeyPrefix + key);
-					var v2 = Deserialize<object>(value);
-					if (UseCompression)
-						v2 = DecompressData((byte[]) v2);
-					if (ttl.HasValue && ttl.Value.Days < 30)
-					{
-						base.Insert(key, v2, (DNNCacheDependency) null, DateTime.UtcNow.Add(ttl.Value), TimeSpan.Zero,
-							CacheItemPriority.Normal, null);
-					}
-					else
-					{
-						base.Insert(key, v2);
-					}
-					return v2;
-				}
-			}
-			catch (Exception e)
-			{
-				if (!ProcessException(e)) throw;
-			}
-			return null;
-		}
+        }
 
 
-		public override void Clear(string type, string data)
-		{
-			Clear(type, data, true);
-		}
+        /// <summary>
+        /// Gets the item. Note: sliding expiration not implemented to avoid too many requests to the redis server
+        /// (see http://stackoverflow.com/questions/20280316/absolute-and-sliding-caching-in-redis)
+        /// </summary>
+        /// <param name="key">The key.</param>
+        /// <returns></returns>
+        public override object GetItem(string key)
+        {
+            try
+            {
+                var v = base.GetItem(key);
+                if (v != null)
+                {
+                    return v;
+                }
 
-		internal void Clear(string type, string data, bool notifyRedis)
-		{
-			try
-			{
-				Logger.Info($"{InstanceUniqueId} - Clearing local cache (type:{type}; data:{data})...");                
-				// Clear internal cache
-				ClearCacheInternal(type, data, true);
+                var value = RedisCache.StringGet(KeyPrefix + key);
+                if (value.HasValue)
+                {
+                    var ttl = RedisCache.KeyTimeToLive(KeyPrefix + key);
+                    var v2 = Deserialize<object>(value);
+                    if (UseCompression)
+                        v2 = DecompressData((byte[])v2);
+                    if (ttl.HasValue && ttl.Value.Days < 30)
+                    {
+                        base.Insert(key, v2, (DNNCacheDependency)null, DateTime.UtcNow.Add(ttl.Value), TimeSpan.Zero,
+                            CacheItemPriority.Normal, null);
+                    }
+                    else
+                    {
+                        base.Insert(key, v2);
+                    }
+                    return v2;
+                }
+            }
+            catch (Exception e)
+            {
+                if (!ProcessException(e)) throw;
+            }
+            return null;
+        }
 
-				if (notifyRedis) // Avoid recursive calls
-				{
-					Logger.Info($"{InstanceUniqueId} - Clearing Redis cache...");				
-					// Clear Redis cache 
-					var hostAndPort = ConnectionString.Split(',')[0];
-					if (!hostAndPort.Contains(":"))
-					{
-						if (hostAndPort.ToLower().Contains(".redis.cache.windows.net"))
-							hostAndPort += ":" + SslDefaultPort;
-						else
-							hostAndPort += ":" + DefaultPort;    
-					}
-						
-					var server = Connection.GetServer(hostAndPort);
-					var keys = server.Keys(RedisCache.Database, pattern: KeyPrefix + "*", pageSize: 10000);
-					foreach (var key in keys)
-					{
-						RedisCache.KeyDelete(key);
-					}
-					Logger.Info($"{InstanceUniqueId} - Notifying cache clearing to other partners...");
-					// Notify the channel
+
+        public override void Clear(string type, string data)
+        {
+            Clear(type, data, true);
+        }
+
+        internal void Clear(string type, string data, bool notifyRedis)
+        {
+            try
+            {
+                Logger.Info($"{InstanceUniqueId} - Clearing local cache (type:{type}; data:{data})...");
+                // Clear internal cache
+                ClearCacheInternal(type, data, true);
+                
+                if (notifyRedis) // Avoid recursive calls
+                {
+                    Logger.Info($"{InstanceUniqueId} - Clearing Redis cache...");
+                    ClearRedisCache(data + "*");
+
+                    Logger.Info($"{InstanceUniqueId} - Notifying cache clearing to other partners...");
+                    // Notify the channel
                     RedisCache.Publish(new RedisChannel(KeyPrefix + "Redis.Clear", RedisChannel.PatternMode.Auto), $"{InstanceUniqueId}:{type}:{data}");
                 }
-			}
-			catch (Exception e)
-			{
-				if (!ProcessException(e)) throw;
-			}
-		}
+            }
+            catch (Exception e)
+            {
+                if (!ProcessException(e)) throw;
+            }
+        }
 
-		public override void Remove(string key)
-		{
-			Remove(key, true);
-		}
+        public override void Remove(string key)
+        {
+            Remove(key, true);
+        }
 
-		internal void Remove(string key, bool notifyRedis)
-		{
-			try
-			{
-				Logger.Info($"{InstanceUniqueId} - Removing cache key {key}...");			
-				// Remove from the internal cache
-				RemoveInternal(key);
+        internal void Remove(string key, bool notifyRedis)
+        {
+            try
+            {
+                Logger.Info($"{InstanceUniqueId} - Removing cache key {key}...");
+                // Remove from the internal cache
+                RemoveInternal(key);
 
-				if (notifyRedis)
-				{
-					Logger.Info($"{InstanceUniqueId} - Removing cache key {key} from Redis...");				
-					// Remove from Redis cache
-					RedisCache.KeyDelete(KeyPrefix + key);
+                if (notifyRedis)
+                {
+                    Logger.Info($"{InstanceUniqueId} - Removing cache key {key} from Redis...");
+                    // Remove from Redis cache
+                    RedisCache.KeyDelete(KeyPrefix + key);
 
-                    Logger.Info($"{InstanceUniqueId} - Telling other partners to remove cache key {key}...");                    
-					// Notify the channel
-					RedisCache.Publish(new RedisChannel(KeyPrefix + "Redis.Remove", RedisChannel.PatternMode.Auto), $"{InstanceUniqueId}:{key}");
-				}
-			}
-			catch (Exception e)
-			{
-				if (!ProcessException(e)) throw;
-			}
-		}
-		
-		#endregion
+                    Logger.Info($"{InstanceUniqueId} - Telling other partners to remove cache key {key}...");
+                    // Notify the channel
+                    RedisCache.Publish(new RedisChannel(KeyPrefix + "Redis.Remove", RedisChannel.PatternMode.Auto), $"{InstanceUniqueId}:{key}");
+                }
+            }
+            catch (Exception e)
+            {
+                if (!ProcessException(e)) throw;
+            }
+        }
 
-		#region Private methods
-		public static string Serialize(object source)
-		{
-			IFormatter formatter = new BinaryFormatter();
-			var stream = new MemoryStream();
-			formatter.Serialize(stream, source);
-			return Convert.ToBase64String(stream.ToArray());
-		}
+        #endregion
 
-		public static T Deserialize<T>(string base64String)
-		{
-			var stream = new MemoryStream(Convert.FromBase64String(base64String));
-			IFormatter formatter = new BinaryFormatter();
-			stream.Position = 0;
-			return (T)formatter.Deserialize(stream);
-		}
+        #region Private methods
+        public static string Serialize(object source)
+        {
+            IFormatter formatter = new BinaryFormatter();
+            var stream = new MemoryStream();
+            formatter.Serialize(stream, source);
+            return Convert.ToBase64String(stream.ToArray());
+        }
 
-		public static byte[] SerializeXmlBinary(object obj)
-		{
-			using (var ms = new MemoryStream())
-			{
-				using (var wtr = XmlDictionaryWriter.CreateBinaryWriter(ms))
-				{
-					var serializer = new NetDataContractSerializer();
-					serializer.WriteObject(wtr, obj);
-					ms.Flush();
-				}
-				return ms.ToArray();
-			}
-		}
-		public static object DeSerializeXmlBinary(byte[] bytes)
-		{
-			using (var rdr = XmlDictionaryReader.CreateBinaryReader(bytes, XmlDictionaryReaderQuotas.Max))
-			{
-				var serializer = new NetDataContractSerializer { AssemblyFormat = FormatterAssemblyStyle.Simple };
-				return serializer.ReadObject(rdr);
-			}
-		}
-		public static byte[] CompressData(object obj)
-		{
-			byte[] inb = SerializeXmlBinary(obj);
-			byte[] outb;
-			using (var ostream = new MemoryStream())
-			{
-				using (var df = new DeflateStream(ostream, CompressionMode.Compress, true))
-				{
-					df.Write(inb, 0, inb.Length);
-				}
+        public static T Deserialize<T>(string base64String)
+        {
+            var stream = new MemoryStream(Convert.FromBase64String(base64String));
+            IFormatter formatter = new BinaryFormatter();
+            stream.Position = 0;
+            return (T)formatter.Deserialize(stream);
+        }
+
+        public static byte[] SerializeXmlBinary(object obj)
+        {
+            using (var ms = new MemoryStream())
+            {
+                using (var wtr = XmlDictionaryWriter.CreateBinaryWriter(ms))
+                {
+                    var serializer = new NetDataContractSerializer();
+                    serializer.WriteObject(wtr, obj);
+                    ms.Flush();
+                }
+                return ms.ToArray();
+            }
+        }
+        public static object DeSerializeXmlBinary(byte[] bytes)
+        {
+            using (var rdr = XmlDictionaryReader.CreateBinaryReader(bytes, XmlDictionaryReaderQuotas.Max))
+            {
+                var serializer = new NetDataContractSerializer { AssemblyFormat = FormatterAssemblyStyle.Simple };
+                return serializer.ReadObject(rdr);
+            }
+        }
+        public static byte[] CompressData(object obj)
+        {
+            byte[] inb = SerializeXmlBinary(obj);
+            byte[] outb;
+            using (var ostream = new MemoryStream())
+            {
+                using (var df = new DeflateStream(ostream, CompressionMode.Compress, true))
+                {
+                    df.Write(inb, 0, inb.Length);
+                }
                 outb = ostream.ToArray();
-			}
+            }
             return outb;
-		}
+        }
 
-		public static object DecompressData(byte[] inb)
-		{
-			byte[] outb;
-			using (var istream = new MemoryStream(inb))
-			{
-				using (var ostream = new MemoryStream())
-				{
-					using (var sr =
-						new DeflateStream(istream, CompressionMode.Decompress))
-					{
-						sr.CopyTo(ostream);
-					}
+        public static object DecompressData(byte[] inb)
+        {
+            byte[] outb;
+            using (var istream = new MemoryStream(inb))
+            {
+                using (var ostream = new MemoryStream())
+                {
+                    using (var sr =
+                        new DeflateStream(istream, CompressionMode.Decompress))
+                    {
+                        sr.CopyTo(ostream);
+                    }
                     outb = ostream.ToArray();
-				}
-			}
+                }
+            }
             return DeSerializeXmlBinary(outb);
-		}
+        }
 
-		private static bool ProcessException(Exception e, string key="", object value = null)
-		{
-			try
-			{
-				if (!bool.Parse(GetProviderConfigAttribute("silentMode", "false")))
-					return false;
+        private static bool ProcessException(Exception e, string key = "", object value = null)
+        {
+            try
+            {
+                if (!bool.Parse(GetProviderConfigAttribute("silentMode", "false")))
+                    return false;
 
-				if (e.GetType() != typeof (ConfigurationErrorsException) && value != null)
-				{
-					Logger.Error(
-						string.Format("Error while trying to store in cache the key {0} (Object type: {1}): {2}", key,
-							value.GetType(), e), e);
-				}
-				else
-				{
-					Logger.Error(e.ToString());
-				}
-				return true;
-			}
-			catch (Exception)
-			{
-				// If the error can't be logged, allow the caller to raise the exception or not
-				// so do nothing
-				return false;
-			}
-		}
-		private static string InstanceUniqueId
-		{
-			get
-			{
-				return KeyPrefix + "Process_" + Process.GetCurrentProcess().Id;
-			}
-		}
+                if (e.GetType() != typeof(ConfigurationErrorsException) && value != null)
+                {
+                    Logger.Error(
+                        string.Format("Error while trying to store in cache the key {0} (Object type: {1}): {2}", key,
+                            value.GetType(), e), e);
+                }
+                else
+                {
+                    Logger.Error(e.ToString());
+                }
+                return true;
+            }
+            catch (Exception)
+            {
+                // If the error can't be logged, allow the caller to raise the exception or not
+                // so do nothing
+                return false;
+            }
+        }
+        private static string InstanceUniqueId
+        {
+            get
+            {
+                return KeyPrefix + "Process_" + Process.GetCurrentProcess().Id;
+            }
+        }
 
-		private static ILog _logger;
-		private static ILog Logger => _logger ?? (_logger = LoggerSource.Instance.GetLogger(typeof(RedisCachingProvider)));
+        private static void ClearRedisCache(string cacheKeyPattern)
+        {
+            // Run Lua script to clear cache on Redis server.
+            // Lua script cannot unpack large list, so it have to unpack not over 1000 keys per a loop
+            var script = "local keys = redis.call('keys', '" + KeyPrefix + cacheKeyPattern + "') " +
+                         "if keys and #keys > 0 then " +
+                         "for i=1,#keys,1000 do redis.call('del', unpack(keys, i, math.min(i+999, #keys))) end return #keys " +
+                         "else return 0 end";
+            RedisCache.ScriptEvaluate(script);
+        }
 
-	    #endregion
-	}
+        private static ILog _logger;
+        private static ILog Logger => _logger ?? (_logger = LoggerSource.Instance.GetLogger(typeof(RedisCachingProvider)));
+
+        #endregion
+    }
 }
