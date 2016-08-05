@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Formatters;
 using System.Runtime.Serialization.Formatters.Binary;
@@ -14,7 +15,6 @@ using DotNetNuke.Common.Utilities;
 using DotNetNuke.Instrumentation;
 using DotNetNuke.Services.Cache;
 using StackExchange.Redis;
-using System.Linq;
 
 namespace DotNetNuke.Providers.RedisCachingProvider
 {
@@ -225,7 +225,7 @@ namespace DotNetNuke.Providers.RedisCachingProvider
                 if (notifyRedis) // Avoid recursive calls
                 {
                     Logger.Info($"{InstanceUniqueId} - Clearing Redis cache...");
-                    ClearRedisCache(data + "*");
+                    ClearRedisCache("*");
 
                     Logger.Info($"{InstanceUniqueId} - Notifying cache clearing to other partners...");
                     // Notify the channel
